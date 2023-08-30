@@ -10,7 +10,7 @@ from psycopg2 import IntegrityError, ProgrammingError, sql
 from psycopg2.errorcodes import UNDEFINED_COLUMN, UNIQUE_VIOLATION
 from psycopg2.extensions import AsIs
 
-from .openupgrade import logged_query, version_info
+from .openupgrade import get_model2table, logged_query, version_info
 from .openupgrade_tools import column_exists, table_exists
 
 logger = logging.getLogger("OpenUpgrade")
@@ -216,11 +216,11 @@ def _change_reference_refs_sql(
     for row in rows:
         try:
             model = env[row[0]]
+            if not model._auto:  # Discard SQL views
+                continue
+            table = model._table
         except KeyError:
-            continue
-        if not model._auto:  # Discard SQL views
-            continue
-        table = model._table
+            table = get_model2table(row[0])
         if not table_exists(cr, table):
             continue
         column = row[1]
@@ -439,6 +439,10 @@ def apply_operations_by_field_type(
             vals[column] = max(field_vals)
         elif operation == "min":
             vals[column] = min(field_vals)
+        elif operation == "first_not_null":
+            field_vals = [x for x in field_vals if x]
+            if field_vals:
+                vals[column] = field_vals[0]
     elif field_type == "boolean":
         if operation:
             field_vals = [False if x is None else x for x in field_vals]
@@ -455,6 +459,10 @@ def apply_operations_by_field_type(
             vals[column] = max(field_vals)
         elif operation == "min":
             vals[column] = min(field_vals)
+        elif operation == "first_not_null":
+            field_vals = [x for x in field_vals if x]
+            if field_vals:
+                vals[column] = field_vals[0]
     elif field_type == "many2many" and method == "orm":
         operation = operation or "merge"
         if operation == "merge":
@@ -492,6 +500,11 @@ def apply_operations_by_field_type(
             if first_value and zip_list:
                 vals[column] = zip_list[0][0]
                 vals[field.model_field] = zip_list[0][1]
+    elif field_type == "selection":
+        if operation == "first_not_null":
+            field_vals = [x for x in field_vals if x]
+            if field_vals:
+                vals[column] = field_vals[0]
     if method == "orm":
         return vals, o2m_changes
     else:
@@ -524,6 +537,7 @@ def _adjust_merged_values_orm(
         - 'avg': Perform the arithmetic average of the values of the records.
         - 'max': Put the maximum of all the values.
         - 'min': Put the minimum of all the values.
+        - 'first_not_null': Put first non-zero value.
         - other value (default for Integer): content on target record
           is preserved
       * Binary field:
@@ -537,6 +551,7 @@ def _adjust_merged_values_orm(
       * Date and Datetime fields:
         - 'max': Put the maximum of all the values.
         - 'min': Put the minimum of all the values.
+        - 'first_not_null': Put first defined Date(time) value.
         - other value (default): content on target record is preserved
       * Many2one fields:
         - 'merge' (default): apply first not null value of the records if
@@ -560,6 +575,7 @@ def _adjust_merged_values_orm(
         - other value: content on target record is preserved
       * Selection fields:
         - any value: content on target record is preserved
+        - 'first_not_null': Put first not null value.
       * Serialized fields:
         - 'first_not_null' (default): For each found key, put first not null value.
         - other value: content on target record is preserved
@@ -757,9 +773,12 @@ def _change_generic(
     ]:
         try:
             model = env[model_to_replace].with_context(active_test=False)
+            table = model._table
         except KeyError:
-            continue
-        if (model._table, res_id_column) in exclude_columns:
+            if method == "orm":
+                continue
+            table = get_model2table(model_to_replace)
+        if (table, res_id_column) in exclude_columns:
             continue
         if method == "orm":
             if not model._fields.get(model_column) or not model._fields.get(
@@ -794,12 +813,12 @@ def _change_generic(
                     "Changed %s record(s) of model '%s'", len(records), model_to_replace
                 )
         else:
-            if not column_exists(
-                env.cr, model._table, res_id_column
-            ) or not column_exists(env.cr, model._table, model_column):
+            if not column_exists(env.cr, table, res_id_column) or not column_exists(
+                env.cr, table, model_column
+            ):
                 continue
             format_args = {
-                "table": sql.Identifier(model._table),
+                "table": sql.Identifier(table),
                 "res_id_column": sql.Identifier(res_id_column),
                 "model_column": sql.Identifier(model_column),
             }
@@ -861,7 +880,10 @@ def _delete_records_sql(
     env, model_name, record_ids, target_record_id, model_table=None
 ):
     if not model_table:
-        model_table = env[model_name]._table
+        try:
+            model_table = env[model_name]._table
+        except KeyError:
+            model_table = get_model2table(model_name)
     logged_query(
         env.cr,
         "DELETE FROM ir_model_data WHERE model = %s AND res_id IN %s",
@@ -892,7 +914,10 @@ def _delete_records_orm(env, model_name, record_ids, target_record_id):
 
 def _check_recurrence(env, model_name, record_ids, target_record_id, model_table=None):
     if not model_table:
-        model_table = env[model_name]._table
+        try:
+            model_table = env[model_name]._table
+        except KeyError:
+            model_table = get_model2table(model_name)
     env.cr.execute(
         """
         SELECT tc.table_name, kcu.column_name, COALESCE(imf.column1, 'id')
@@ -1009,13 +1034,19 @@ def merge_records(
         # TODO: serialized fields
         with env.norecompute():
             _adjust_merged_values_orm(*args2)
-        env[model_name].recompute()
+        if version_info[0] > 15:
+            env[model_name].flush_model()
+        else:
+            env[model_name].recompute()
         if delete:
             _delete_records_orm(env, model_name, record_ids, target_record_id)
     else:
         # Check which records to be merged exist
         if not model_table:
-            model_table = env[model_name]._table
+            try:
+                model_table = env[model_name]._table
+            except KeyError:
+                model_table = get_model2table(model_name)
         env.cr.execute(
             sql.SQL("SELECT id FROM {} WHERE id IN %s").format(
                 sql.Identifier(model_table)
